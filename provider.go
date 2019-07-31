@@ -16,7 +16,8 @@ func Provider() terraform.ResourceProvider {
 			},
 		},
 		ResourcesMap: map[string]*schema.Resource{
-			"slack_channel": resourceChannel(),
+			"slack_channel":              resourceChannel(),
+			"slack_conversation_members": resourceConversationMembers(),
 		},
 		ConfigureFunc: configureProvider,
 	}
