@@ -1,14 +1,13 @@
 package main
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
 	"github.com/hashicorp/terraform/helper/schema"
-	"github.com/timdurward/slack"
+	"github.com/nlopes/slack"
 )
 
 func resourceConversationMembers() *schema.Resource {
@@ -33,6 +32,11 @@ func resourceConversationMembers() *schema.Resource {
 				MinItems:    1,
 				// TODO: validate that the ":" separator is present
 				// ValidateFunc: validation.StringInSlice(),
+			},
+			"members_ids": &schema.Schema{
+				Type:     schema.TypeList,
+				Elem:     &schema.Schema{Type: schema.TypeString},
+				Computed: true,
 			},
 		},
 	}
@@ -75,83 +79,91 @@ func getUserInfo(api *slack.Client, userExpression string) (*slack.User, error) 
 
 func conversationMembersIDToInvite(api *slack.Client, c *slack.Channel, userExpressions []string) ([]string, error) {
 	var usersToInvite []string
+	usersManaged := make([]string, 0, len(userExpressions))
 
 	for _, uE := range userExpressions {
 		user, err := getUserInfo(api, uE)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("getUserInfo: %s", err)
 		}
-		for i, cm := range c.Members {
-			if user.ID == cm {
+		s := usersManaged[:0]
+		// return nil, fmt.Errorf("uid: %s", user.ID)
+		s = append(s, user.ID)
+	}
+
+	return nil, fmt.Errorf("slice: %s", usersManaged)
+
+	conversationMembers, _, _ := api.GetUsersInConversation(&slack.GetUsersInConversationParameters{
+		ChannelID: c.ID,
+		Cursor:    "",
+		Limit:     0,
+	})
+
+	for i, um := range usersManaged {
+		for _, cm := range conversationMembers {
+			if um == cm {
 				continue
 			}
-			if i == len(c.Members)-1 {
-				usersToInvite = append(usersToInvite, user.ID)
+			if i == len(usersManaged)-1 {
+				usersToInvite = append(usersToInvite, um)
 			}
 		}
 	}
+
 	sort.Strings(usersToInvite)
 	return usersToInvite, nil
 }
 
 func resourceConversationMembersRead(d *schema.ResourceData, meta interface{}) error {
 	api := slack.New(meta.(*Config).APIToken)
-	var usersInvited []string
-	// var usersToInvite []string
 
-	if conversation, err := api.GetConversationInfo(d.Get("conversation_id").(string), false); err.Error() == "conversation_not_found" {
-		// Remove the resource if the conversation is not present anymore
+	conversation, err := api.GetConversationInfo(d.Get("conversation_id").(string), false)
+	if err != nil {
 		d.SetId("")
-	} else if err != nil {
-		return err
-	} else {
-		if err := d.Set("conversation_id", conversation.ID); err != nil {
-			return err
-		}
-		for _, m := range d.Get("members_ids").([]string) {
-			for _, cm := range conversation.Members {
-				if cm == m {
-					usersInvited = append(usersInvited, cm)
-				}
-			}
-		}
-		sort.Strings(usersInvited)
-		if err := d.Set("members_ids", usersInvited); err != nil {
-			return err
-		}
+		return fmt.Errorf("Could not get conversation details: %s", err)
 	}
+
+	if err := d.Set("conversation_id", conversation.ID); err != nil {
+		return fmt.Errorf("Could not set conversation_id within terraform state: %s", err)
+	}
+
+	membersIds := conversation.Members
+	sort.Strings(membersIds)
+	if err := d.Set("members_ids", membersIds); err != nil {
+		return fmt.Errorf("Could not set members_ids within terraform state: %s", err)
+	}
+
 	return nil
 }
 
 func resourceConversationMembersCreate(d *schema.ResourceData, meta interface{}) error {
 	api := slack.New(meta.(*Config).APIToken)
-	var resourceID bytes.Buffer
 	conversation, err := api.GetConversationInfo(d.Get("conversation_id").(string), false)
 	if err != nil {
-		return err
+		return fmt.Errorf("Could not get conversation details: %s", err)
 	}
 
-	resourceID.WriteString("conversation-members-")
-	resourceID.WriteString(conversation.ID)
-	d.SetId(resourceID.String())
-
-	if members, ok := d.Get("members").([]string); ok {
-		usersToInvite, err := conversationMembersIDToInvite(api, conversation, members)
-		if err != nil {
-			return err
-		}
-		if _, err := api.InviteUsersToConversation(conversation.ID, usersToInvite...); err != nil {
-			return err
-		}
-		sort.Strings(usersToInvite)
-		err = d.Set("members_ids", usersToInvite)
-		if err != nil {
-			return err
-		}
-	} else {
-		return fmt.Errorf("could not convert members attribute to []string")
+	members := d.Get("members").([]interface{})
+	m := make([]string, len(members))
+	for i, v := range members {
+		m[i] = v.(string)
 	}
 
+	usersToInvite, err := conversationMembersIDToInvite(api, conversation, m)
+	if err != nil {
+		return fmt.Errorf("could not convert members attribute to []string: %s", err)
+	}
+	// Try to invite all users in one API call
+	if _, err := api.InviteUsersToConversation(conversation.ID, usersToInvite...); err != nil {
+		for _, u := range usersToInvite {
+			// Try one by one if that does not work
+			if _, err := api.InviteUsersToConversation(conversation.ID, u); err != nil {
+				return fmt.Errorf("Could not invite user %s to conversation: %s", u, err)
+			}
+		}
+	}
+
+	d.SetId(conversation.ID)
 	return resourceConversationMembersRead(d, meta)
 }
 
@@ -160,18 +172,29 @@ func resourceConversationMembersUpdate(d *schema.ResourceData, meta interface{})
 
 	conversation, err := api.GetConversationInfo(d.Get("conversation_id").(string), false)
 	if err != nil {
-		return err
+		return fmt.Errorf("Could not get conversation information: %s", err)
 	}
 
-	if members, ok := d.Get("members").([]string); ok && (d.HasChange("members") || d.HasChange("members_ids")) {
-		usersToInvite, err := conversationMembersIDToInvite(api, conversation, members)
+	members := d.Get("members").([]interface{})
+	m := make([]string, len(members))
+	for i, v := range members {
+		m[i] = v.(string)
+	}
+
+	if d.HasChange("members") || d.HasChange("members_ids") {
+		usersToInvite, err := conversationMembersIDToInvite(api, conversation, m)
 		if err != nil {
-			return err
+			return fmt.Errorf("Could not get members ids to from members to invite: %s", err)
 		}
 
 		// Invite new users
 		if _, err := api.InviteUsersToConversation(conversation.ID, usersToInvite...); err != nil {
-			return err
+			for _, u := range usersToInvite {
+				// Try one by one if that does not work
+				if _, err := api.InviteUsersToConversation(conversation.ID, u); err != nil {
+					return fmt.Errorf("Could not invite user %s to conversation: %s", u, err)
+				}
+			}
 		}
 
 		// Remove absent users
@@ -183,24 +206,12 @@ func resourceConversationMembersUpdate(d *schema.ResourceData, meta interface{})
 				}
 				oldUser, err := getUserInfo(api, o)
 				if err != nil {
-					return err
+					return fmt.Errorf("Could not get old user %s information: %s", o, err)
 				}
-				api.KickUserFromConversation(conversation.ID, oldUser.ID)
+				if err := api.KickUserFromConversation(conversation.ID, oldUser.ID); err != nil {
+					return fmt.Errorf("Could not uninvite user %s from conversation: %s", o, err)
+				}
 			}
-		}
-
-		// Sync state
-		var ids []string
-		for _, e := range d.Get("members").([]string) {
-			user, err := getUserInfo(api, e)
-			if err != nil {
-				return err
-			}
-			ids = append(ids, user.Profile.Email)
-		}
-		sort.Strings(ids)
-		if err := d.Set("members_ids", ids); err != nil {
-			return err
 		}
 	}
 	return resourceConversationMembersRead(d, meta)
@@ -208,8 +219,15 @@ func resourceConversationMembersUpdate(d *schema.ResourceData, meta interface{})
 
 func resourceConversationMembersDelete(d *schema.ResourceData, meta interface{}) error {
 	api := slack.New(meta.(*Config).APIToken)
-	for _, m := range d.Get("members_ids").([]string) {
-		switch err := api.KickUserFromConversation(d.Get("conversation_id").(string), m); err.Error() {
+
+	members := d.Get("members").([]interface{})
+	m := make([]string, len(members))
+	for i, v := range members {
+		m[i] = v.(string)
+	}
+
+	for _, mi := range m {
+		switch err := api.KickUserFromConversation(d.Get("conversation_id").(string), mi); err.Error() {
 		case "user_not_found":
 			continue
 		case "conversation_not_found":
@@ -217,7 +235,7 @@ func resourceConversationMembersDelete(d *schema.ResourceData, meta interface{})
 		case "not_in_conversation":
 			continue
 		default:
-			return err
+			return fmt.Errorf("Could not uninvite user %s from conversation: %s", m, err)
 		}
 	}
 	return nil
