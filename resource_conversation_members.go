@@ -1,13 +1,12 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
 	"github.com/hashicorp/terraform/helper/schema"
-	"github.com/nlopes/slack"
+	"github.com/timdurward/slack"
 )
 
 func resourceConversationMembers() *schema.Resource {
@@ -42,6 +41,7 @@ func resourceConversationMembers() *schema.Resource {
 	}
 }
 
+// Returnes (*slack.User, error) from an email
 func getUserByEmail(api *slack.Client, email string) (*slack.User, error) {
 	user, err := api.GetUserByEmail(email)
 	if err != nil {
@@ -50,6 +50,7 @@ func getUserByEmail(api *slack.Client, email string) (*slack.User, error) {
 	return user, nil
 }
 
+// Returns (*slack.User, error) from a user expression (i.e. "bot:mybot", "id:myid", "email:my@email.corp")
 func getUserInfo(api *slack.Client, userExpression string) (*slack.User, error) {
 	userIdentifier := strings.SplitAfter(userExpression, ":")[1]
 
@@ -60,76 +61,107 @@ func getUserInfo(api *slack.Client, userExpression string) (*slack.User, error) 
 		return api.GetUserInfo(userIdentifier)
 	}
 	if strings.Contains(userExpression, "bot:") {
-		if users, err := api.GetUsers(); err != nil {
-			for _, u := range users {
-				if !u.IsBot {
-					continue
-				}
-				if !(u.Name == userIdentifier) {
-					continue
-				}
+		users, err := api.GetUsers()
+		if err != nil {
+			return nil, fmt.Errorf("getUserInfo: Could not get the list of users")
+		}
+		for i, u := range users {
+			if !u.IsBot {
+				continue
+			}
+			if u.Name == userIdentifier {
 				return api.GetUserInfo(u.ID)
 			}
-		} else {
-			return nil, err
+			if i == len(users)-1 {
+				return nil, fmt.Errorf("Could not find the bot: %s", userIdentifier)
+			}
 		}
 	}
-	return nil, errors.New("only 'bot:*' , 'id:*' and 'email:*' member expressions are supported")
+	return nil, fmt.Errorf("only 'bot:*' , 'id:*' and 'email:*' member expressions are supported: %s", userExpression)
 }
 
-func conversationMembersIDToInvite(api *slack.Client, c *slack.Channel, userExpressions []string) ([]string, error) {
-	var usersToInvite []string
-	usersManaged := make([]string, 0, len(userExpressions))
+// Returns a list of memberIDs to kick when given a list of managed slack users that, them, should be present
+// Authoritative for a given channel
+func getConversationUserIdsToKickAuthoritative(api *slack.Client, c *slack.Channel, managedUsers []*slack.User) ([]string, error) {
+	var userIdsToKick []string
 
-	for _, uE := range userExpressions {
-		user, err := getUserInfo(api, uE)
-		if err != nil {
-			return nil, fmt.Errorf("getUserInfo: %s", err)
-		}
-		s := usersManaged[:0]
-		// return nil, fmt.Errorf("uid: %s", user.ID)
-		s = append(s, user.ID)
-	}
-
-	return nil, fmt.Errorf("slice: %s", usersManaged)
-
-	conversationMembers, _, _ := api.GetUsersInConversation(&slack.GetUsersInConversationParameters{
+	conversationMembers, _, err := api.GetUsersInConversation(&slack.GetUsersInConversationParameters{
 		ChannelID: c.ID,
 		Cursor:    "",
 		Limit:     0,
 	})
+	if err != nil {
+		return nil, fmt.Errorf("getConversationUserIdsToKickAuthoritative: Could not get the list of users in the conversation %s! %s", c.Name, err)
+	}
 
-	for i, um := range usersManaged {
-		for _, cm := range conversationMembers {
-			if um == cm {
+	for _, cm := range conversationMembers {
+		for i, mu := range managedUsers {
+			if cm == mu.ID {
 				continue
 			}
-			if i == len(usersManaged)-1 {
-				usersToInvite = append(usersToInvite, um)
+			if i == len(managedUsers)-1 {
+				userIdsToKick = append(userIdsToKick, mu.ID)
 			}
 		}
 	}
+	return userIdsToKick, nil
+}
 
-	sort.Strings(usersToInvite)
-	return usersToInvite, nil
+// Returns a list of memberIDs to invite when given a list of managed slack users that should be present
+func getConversationUserIdsToInvite(api *slack.Client, c *slack.Channel, managedUsers []*slack.User) ([]string, error) {
+	var usersIdsToInvite []string
+
+	conversationMembers, _, err := api.GetUsersInConversation(&slack.GetUsersInConversationParameters{
+		ChannelID: c.ID,
+		Cursor:    "",
+		Limit:     0,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("getConversationUserIdsToInvite: Could not get the list of users in the conversation %s! %s", c.Name, err)
+	}
+
+	for _, mu := range managedUsers {
+		for i, cm := range conversationMembers {
+			if mu.ID == cm {
+				continue
+			}
+			if i == len(conversationMembers)-1 {
+				usersIdsToInvite = append(usersIdsToInvite, mu.ID)
+			}
+		}
+	}
+	// TODO: move the sort to the create/update resources
+	sort.Strings(usersIdsToInvite)
+	return usersIdsToInvite, nil
 }
 
 func resourceConversationMembersRead(d *schema.ResourceData, meta interface{}) error {
 	api := slack.New(meta.(*Config).APIToken)
-
-	conversation, err := api.GetConversationInfo(d.Get("conversation_id").(string), false)
+	c, err := api.GetConversationInfo(d.Get("conversation_id").(string), false)
 	if err != nil {
 		d.SetId("")
-		return fmt.Errorf("Could not get conversation details: %s", err)
+		return nil
 	}
 
-	if err := d.Set("conversation_id", conversation.ID); err != nil {
+	conversationMembers, _, err := api.GetUsersInConversation(&slack.GetUsersInConversationParameters{
+		ChannelID: c.ID,
+		Cursor:    "",
+		Limit:     0,
+	})
+	if err != nil {
+		return fmt.Errorf("resourceConversationMembersRead: Could not get the list of users in the conversation %s! %s", c.Name, err)
+	}
+
+	sort.Strings(conversationMembers)
+
+	// TODO: set partial state?
+	err = d.Set("conversation_id", c.ID)
+	if err != nil {
 		return fmt.Errorf("Could not set conversation_id within terraform state: %s", err)
 	}
 
-	membersIds := conversation.Members
-	sort.Strings(membersIds)
-	if err := d.Set("members_ids", membersIds); err != nil {
+	err = d.Set("members_ids", conversationMembers)
+	if err != nil {
 		return fmt.Errorf("Could not set members_ids within terraform state: %s", err)
 	}
 
@@ -138,78 +170,77 @@ func resourceConversationMembersRead(d *schema.ResourceData, meta interface{}) e
 
 func resourceConversationMembersCreate(d *schema.ResourceData, meta interface{}) error {
 	api := slack.New(meta.(*Config).APIToken)
-	conversation, err := api.GetConversationInfo(d.Get("conversation_id").(string), false)
+	c, err := api.GetConversationInfo(d.Get("conversation_id").(string), false)
 	if err != nil {
 		return fmt.Errorf("Could not get conversation details: %s", err)
 	}
 
 	members := d.Get("members").([]interface{})
-	m := make([]string, len(members))
-	for i, v := range members {
-		m[i] = v.(string)
-	}
-
-	usersToInvite, err := conversationMembersIDToInvite(api, conversation, m)
-	if err != nil {
-		return fmt.Errorf("could not convert members attribute to []string: %s", err)
-	}
-	// Try to invite all users in one API call
-	if _, err := api.InviteUsersToConversation(conversation.ID, usersToInvite...); err != nil {
-		for _, u := range usersToInvite {
-			// Try one by one if that does not work
-			if _, err := api.InviteUsersToConversation(conversation.ID, u); err != nil {
-				return fmt.Errorf("Could not invite user %s to conversation: %s", u, err)
-			}
+	managedUsers := make([]*slack.User, len(members))
+	for i, m := range members {
+		managedUsers[i], err = getUserInfo(api, m.(string))
+		if err != nil {
+			return err
 		}
 	}
 
-	d.SetId(conversation.ID)
+	usersToInvite, err := getConversationUserIdsToInvite(api, c, managedUsers)
+	if err != nil {
+		return err
+	}
+	// Invite all relevant users in a single API call
+	_, err = api.InviteUsersToConversation(c.ID, usersToInvite...)
+	if err != nil {
+		return fmt.Errorf("Could not invite users to conversation: %s", err)
+	}
+
+	d.SetId(c.ID)
 	return resourceConversationMembersRead(d, meta)
 }
 
 func resourceConversationMembersUpdate(d *schema.ResourceData, meta interface{}) error {
 	api := slack.New(meta.(*Config).APIToken)
-
-	conversation, err := api.GetConversationInfo(d.Get("conversation_id").(string), false)
+	c, err := api.GetConversationInfo(d.Get("conversation_id").(string), false)
 	if err != nil {
 		return fmt.Errorf("Could not get conversation information: %s", err)
 	}
 
 	members := d.Get("members").([]interface{})
-	m := make([]string, len(members))
-	for i, v := range members {
-		m[i] = v.(string)
+	managedUsers := make([]*slack.User, len(members))
+	for i, m := range members {
+		managedUsers[i], err = getUserInfo(api, m.(string))
+		if err != nil {
+			return err
+		}
 	}
 
-	if d.HasChange("members") || d.HasChange("members_ids") {
-		usersToInvite, err := conversationMembersIDToInvite(api, conversation, m)
-		if err != nil {
-			return fmt.Errorf("Could not get members ids to from members to invite: %s", err)
-		}
+	userIdsToInvite, err := getConversationUserIdsToInvite(api, c, managedUsers)
+	if err != nil {
+		return fmt.Errorf("Could not get members'ids to invite: %s", err)
+	}
 
-		// Invite new users
-		if _, err := api.InviteUsersToConversation(conversation.ID, usersToInvite...); err != nil {
-			for _, u := range usersToInvite {
-				// Try one by one if that does not work
-				if _, err := api.InviteUsersToConversation(conversation.ID, u); err != nil {
-					return fmt.Errorf("Could not invite user %s to conversation: %s", u, err)
-				}
+	// Invite new users
+	c, err = api.InviteUsersToConversation(c.ID, userIdsToInvite...)
+	if err != nil {
+		return fmt.Errorf("Could not invite users")
+	}
+
+	// Kick previously managed users only
+	// (non-authoritative for a given conversation)
+	oldMembers, newMembers := d.GetChange("members")
+	for _, o := range oldMembers.([]string) {
+		for i, n := range newMembers.([]string) {
+			if o == n {
+				continue
 			}
-		}
-
-		// Remove absent users
-		oldMembersEmails, newMembersEmails := d.GetChange("members")
-		for _, o := range oldMembersEmails.([]string) {
-			for _, n := range newMembersEmails.([]string) {
-				if o == n {
-					continue
-				}
-				oldUser, err := getUserInfo(api, o)
+			if i == len(newMembers.([]string))-1 {
+				u, err := getUserInfo(api, o)
 				if err != nil {
 					return fmt.Errorf("Could not get old user %s information: %s", o, err)
 				}
-				if err := api.KickUserFromConversation(conversation.ID, oldUser.ID); err != nil {
-					return fmt.Errorf("Could not uninvite user %s from conversation: %s", o, err)
+				err = api.KickUserFromConversation(c.ID, u.ID)
+				if err != nil {
+					return fmt.Errorf("Could not kick user %s from conversation: %s", o, err)
 				}
 			}
 		}
@@ -227,14 +258,12 @@ func resourceConversationMembersDelete(d *schema.ResourceData, meta interface{})
 	}
 
 	for _, mi := range m {
-		switch err := api.KickUserFromConversation(d.Get("conversation_id").(string), mi); err.Error() {
-		case "user_not_found":
-			continue
-		case "conversation_not_found":
-			continue
-		case "not_in_conversation":
-			continue
-		default:
+		u, err := getUserInfo(api, mi)
+		if err != nil {
+			return err
+		}
+		err = api.KickUserFromConversation(d.Get("conversation_id").(string), u.ID)
+		if err != nil && err.Error() != "user_not_found" && err.Error() != "conversation_not_found" && err.Error() == "not_in_conversation" {
 			return fmt.Errorf("Could not uninvite user %s from conversation: %s", m, err)
 		}
 	}
