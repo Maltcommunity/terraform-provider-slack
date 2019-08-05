@@ -14,7 +14,7 @@ resource "slack_conversation_members" "public-channel" {
     "email:user@domain.com",
     "id:UXXXXXXXX"
   ]
-  authoritative: false
+  authoritative = false
 }
 
 resource "slack_conversation_members" "private-channel" {
@@ -23,5 +23,5 @@ resource "slack_conversation_members" "private-channel" {
     "email:jane@domain.com",
     "email:john@domain.com"
   ]
-  authoritative: true
+  authoritative = true
 }
