@@ -7,7 +7,7 @@ import (
 	"strings"
 	
 	"github.com/hashicorp/terraform/helper/schema"
-	"github.com/timdurward/slack"
+	"github.com/nlopes/slack"
 )
 
 func resourceConversationMembers() *schema.Resource {
@@ -26,7 +26,7 @@ func resourceConversationMembers() *schema.Resource {
 			"members": &schema.Schema{
 				Type:        schema.TypeList,
 				Elem:        &schema.Schema{Type: schema.TypeString},
-				Description: "List of Slack users to invite, the following formats are supported: 'email:user@some.domain', 'id:userid'",
+				Description: "List of Slack users to invite, the following formats are supported: 'email:user@some.domain', 'id:userId'",
 				Required:    true,
 				MinItems:    1,
 				// TODO: validate that the ":" separator is present, once ValidateFunc is supported on lists
@@ -43,7 +43,6 @@ func resourceConversationMembers() *schema.Resource {
 				Optional:    true,
 				Required:    false,
 				Default:     false,
-				ForceNew:    true,
 				Description: "if set to true, any member not present within the members attributes will be forcibly kicked out from the conversation (except for the token owner) (default is false)",
 			},
 		},
@@ -182,7 +181,7 @@ func resourceConversationMembersRead(d *schema.ResourceData, meta interface{}) e
 		d.SetId("")
 		return nil
 	}
-
+ 
 	conversationMembers, _, err := api.GetUsersInConversation(&slack.GetUsersInConversationParameters{
 		ChannelID: c.ID,
 		Cursor:    "", // TODO: implement a cursor for paginated API reads
@@ -323,7 +322,6 @@ func resourceConversationMembersUpdate(d *schema.ResourceData, meta interface{})
 			return err
 		}
 	}
-	//return fmt.Errorf("usersToKick: %s, managedUsers: %s", usersToKick, managedUsers)
 	if len(usersToKick) > 0 {
 		err = kickUsers(api, c, usersToKick)
 		if err != nil {
@@ -349,12 +347,12 @@ func resourceConversationMembersDelete(d *schema.ResourceData, meta interface{})
 	members := make(map[string]string, 0)
 	membersKeys := make([]string, 0)
 
-	old, new := d.GetChange("members")
-	for _, o := range old.([]interface{}) {
+	oldUsers, newUsers := d.GetChange("members")
+	for _, o := range oldUsers.([]interface{}) {
 		members[o.(string)] = ""
 		membersKeys = append(membersKeys, o.(string))
 	}
-	for _, n := range new.([]interface{}) {
+	for _, n := range newUsers.([]interface{}) {
 		if _, ok := members[n.(string)]; !ok {
 			members[n.(string)] = ""
 			membersKeys = append(membersKeys, n.(string))

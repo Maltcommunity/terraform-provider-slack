@@ -46,7 +46,7 @@ func resourceChannelCreate(d *schema.ResourceData, meta interface{}) error {
 
 	// Create Slack Channel
 	channel, err := api.CreateChannel(d.Get("channel_name").(string))
-	if err.Error() == "name_taken" {
+	if err != nil && err.Error() == "name_taken" {
 		// Channel most likely has to be unarchived
 		channels, err := api.GetChannels(false)
 		if err != nil {
@@ -71,7 +71,7 @@ func resourceChannelCreate(d *schema.ResourceData, meta interface{}) error {
 		}
 	} else if err == nil {
 		d.SetId(channel.ID)
-	} else if err != nil {
+	} else {
 		return err
 	}
 
