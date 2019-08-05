@@ -5,7 +5,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
-
+	
 	"github.com/hashicorp/terraform/helper/schema"
 	"github.com/timdurward/slack"
 )
@@ -33,9 +33,10 @@ func resourceConversationMembers() *schema.Resource {
 				// ValidateFunc: validation.StringInSlice([]string{"foo:"}, false),
 			},
 			"members_ids": &schema.Schema{
-				Type:     schema.TypeList,
-				Elem:     &schema.Schema{Type: schema.TypeString},
-				Computed: true,
+				Type:        schema.TypeList,
+				Elem:        &schema.Schema{Type: schema.TypeString},
+				Description: "IDs of the members",
+				Computed:    true,
 			},
 			"authoritative": &schema.Schema{
 				Type:        schema.TypeBool,
@@ -68,6 +69,35 @@ func getUserInfo(api *slack.Client, userExpression string) (*slack.User, error) 
 		return api.GetUserInfo(userIdentifier)
 	}
 	return nil, fmt.Errorf("only 'id:*' and 'email:*' member expressions are supported: %s", userExpression)
+}
+
+func getUsersToKickAuthoritative(api *slack.Client, c *slack.Channel, managedUsers []*slack.User) ([]*slack.User, error) {
+    intruders := make([]*slack.User, 0)
+	
+	conversationMembers, _, err := api.GetUsersInConversation(&slack.GetUsersInConversationParameters{
+		ChannelID: c.ID,
+		Cursor:    "", // TODO: implement a cursor for paginated API reads
+		Limit:     0,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("(kickUsers) could not get the list of users in the conversation %s! %s", c.Name, err)
+	}
+	
+	for _, cmId := range conversationMembers {
+		for i, m := range managedUsers {
+			if m.ID == cmId {
+				break
+			}
+			if i == len(managedUsers)-1 {
+				intruder, err := api.GetUserInfo(cmId)
+				if err != nil {
+					return nil, fmt.Errorf("could not get intruder user %s information: %s", cmId, err)
+				}
+				intruders = append(intruders, intruder)
+			}
+		}
+	}
+	return intruders, nil
 }
 
 // Kicks users out of a given conversation
@@ -115,7 +145,7 @@ func inviteUsers(api *slack.Client, c *slack.Channel, managedUsers []*slack.User
 	//for _, mu := range managedUsers {
 	//	for i, cm := range conversationMembers {
 	//		if mu.ID == cm {
-	//			continue
+	//			break
 	//		}
 	//		if i == len(conversationMembers)-1 {
 	//			usersIdsToInvite = append(usersIdsToInvite, mu.ID)
@@ -142,7 +172,6 @@ func inviteUsers(api *slack.Client, c *slack.Channel, managedUsers []*slack.User
 			}
 		}
 	}
-	//}
 	return nil
 }
 
@@ -162,22 +191,49 @@ func resourceConversationMembersRead(d *schema.ResourceData, meta interface{}) e
 	if err != nil {
 		return fmt.Errorf("resourceConversationMembersRead: could not get the list of users in the conversation %s! %s", c.Name, err)
 	}
-	// Sort the members' list before persisting it within terraform state, to avoid un-needed state changes
-	sort.Strings(conversationMembers)
 
 	// Synchronize terraform state's members attribute relative to present conversation members
 	members := d.Get("members").([]interface{})
+	membersUsers := make([]*slack.User, 0)
 	presentMembers := make([]string, 0)
 	presentMembersIds := make([]string, 0)
 
 	for _, m := range members {
 		mi, _ := getUserInfo(api, m.(string))
-		for _, cm := range conversationMembers {
-			if mi.ID == cm {
+		membersUsers = append(membersUsers, mi)
+		for _, cmId := range conversationMembers {
+			if mi.ID == cmId {
 				presentMembers = append(presentMembers, m.(string))
 				presentMembersIds = append(presentMembersIds, mi.ID)
 				break
 			}
+		}
+	}
+	
+	sort.Strings(presentMembersIds)
+	
+	if d.Get("authoritative").(bool) {
+		intruders := make([]*slack.User, 0)
+		for _, cmId := range conversationMembers {
+			for i, m := range membersUsers {
+				if m.ID == cmId {
+					break
+				}
+				if i == len(membersUsers)-1 {
+					intruder, err := api.GetUserInfo(cmId)
+					if err != nil {
+						return fmt.Errorf("could not get user %s information: %s", cmId, err)
+					}
+					intruders = append(intruders, intruder)
+				}
+			}
+		}
+		for _, intruder := range intruders {
+			b := strings.Builder{}
+			b.WriteString("id:")
+			b.WriteString(intruder.ID)
+			presentMembers = append(presentMembers, b.String())
+			presentMembersIds = append(presentMembersIds, intruder.ID)
 		}
 	}
 
@@ -209,6 +265,15 @@ func resourceConversationMembersCreate(d *schema.ResourceData, meta interface{})
 	if err != nil {
 		return err
 	}
+	if d.Get("authoritative").(bool) {
+		usersToKick, err := getUsersToKickAuthoritative(api, c, managedUsers)
+		if err != nil {
+			return err
+		}
+		if err = kickUsers(api, c, usersToKick); err != nil {
+			return err
+		}
+	}
 	b := strings.Builder{}
 	b.WriteString(c.ID)
 	b.WriteString("-members")
@@ -218,11 +283,12 @@ func resourceConversationMembersCreate(d *schema.ResourceData, meta interface{})
 
 func resourceConversationMembersUpdate(d *schema.ResourceData, meta interface{}) error {
 	api := slack.New(meta.(*Config).APIToken)
+	usersToKick := make([]*slack.User, 0)
 	c, err := api.GetConversationInfo(d.Get("conversation_id").(string), false)
 	if err != nil {
 		return fmt.Errorf("could not get conversation information: %s", err)
 	}
-
+	
 	members := d.Get("members").([]interface{})
 	managedUsers := make([]*slack.User, len(members))
 	for i, m := range members {
@@ -231,12 +297,7 @@ func resourceConversationMembersUpdate(d *schema.ResourceData, meta interface{})
 			return err
 		}
 	}
-	err = inviteUsers(api, c, managedUsers)
-	if err != nil {
-		return err
-	}
 
-	usersToKick := make([]*slack.User, 0)
 	if !d.Get("authoritative").(bool) {
 		// Kick previously managed users ONLY
 		// (non-authoritative for a given conversation)
@@ -258,30 +319,19 @@ func resourceConversationMembersUpdate(d *schema.ResourceData, meta interface{})
 	} else {
 		// Kick all users not managed by terraform
 		// (authoritative for a given conversation)
-		conversationMembers, _, err := api.GetUsersInConversation(&slack.GetUsersInConversationParameters{
-			ChannelID: c.ID,
-			Cursor:    "", // TODO: implement a cursor for paginated API reads
-			Limit:     0,
-		})
-		if err != nil {
-			return fmt.Errorf("(kickUsers) could not get the list of users in the conversation %s! %s", c.Name, err)
-		}
-		for _, m := range conversationMembers {
-			for i, u := range managedUsers {
-				if m == u.ID {
-					break
-				}
-				if i == len(managedUsers)-1 {
-					usersToKick = append(usersToKick, u)
-				}
-			}
+		if usersToKick, err = getUsersToKickAuthoritative(api, c, managedUsers); err != nil {
+			return err
 		}
 	}
+	//return fmt.Errorf("usersToKick: %s, managedUsers: %s", usersToKick, managedUsers)
 	if len(usersToKick) > 0 {
 		err = kickUsers(api, c, usersToKick)
 		if err != nil {
 			return err
 		}
+	}
+	if err = inviteUsers(api, c, managedUsers); err != nil {
+		return err
 	}
 	return resourceConversationMembersRead(d, meta)
 }
@@ -298,7 +348,7 @@ func resourceConversationMembersDelete(d *schema.ResourceData, meta interface{})
 	// Kick all users in case of simultaneous state change + resource destruction
 	members := make(map[string]string, 0)
 	membersKeys := make([]string, 0)
-	
+
 	old, new := d.GetChange("members")
 	for _, o := range old.([]interface{}) {
 		members[o.(string)] = ""
@@ -310,7 +360,7 @@ func resourceConversationMembersDelete(d *schema.ResourceData, meta interface{})
 			membersKeys = append(membersKeys, n.(string))
 		}
 	}
-	
+
 	for _, m := range membersKeys {
 		u, err := getUserInfo(api, m)
 		if err != nil {
